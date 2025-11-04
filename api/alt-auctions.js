@@ -46,7 +46,7 @@ export default async function handler(req, res) {
       }
     };
 
-    const r = await fetch("https://api.alt.xyz/v1/graphql", {
+    const r = await fetch("https://api.alt.xyz/graphql", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
