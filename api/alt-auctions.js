@@ -1,32 +1,20 @@
 import fetch from "node-fetch";
 
-// Try multiple Alt GraphQL endpoints and use the first that works.
-const ALT_ENDPOINT_CANDIDATES = [
+const ALT_ENDPOINTS = [
   "https://api.alt.xyz/graphql",
   "https://app.alt.xyz/graphql",
   "https://alt.xyz/graphql"
 ];
 
-async function postGraphQL(body) {
-  const errors = [];
-  for (const url of ALT_ENDPOINT_CANDIDATES) {
-    try {
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      // If DNS resolved and we got a response, return it (even if it's a 4xx/5xx we'll surface below)
-      return { response: r, endpoint: url };
-    } catch (e) {
-      // Keep track of which endpoint failed and why (e.g., ENOTFOUND)
-      errors.push({ url, message: e.message });
-    }
-  }
-  // None resolved — throw a helpful error
-  const detail = errors.map(x => `${x.url} → ${x.message}`).join(" | ");
-  throw new Error(`All Alt endpoints failed DNS/connection: ${detail}`);
-}
+const BROWSER_LIKE_HEADERS = {
+  "Accept": "application/json, text/plain, */*",
+  "Content-Type": "application/json",
+  "Origin": "https://alt.xyz",
+  "Referer": "https://alt.xyz/",
+  // Generic desktop UA; some edges reject “node-fetch”
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+};
 
 function isoToHuman(iso) {
   if (!iso) return { seconds: null, human: null };
@@ -36,6 +24,34 @@ function isoToHuman(iso) {
   const h = Math.floor((left % 86400) / 3600);
   const m = Math.floor((left % 3600) / 60);
   return { seconds: left, human: `${d ? d + "d " : ""}${h}h ${m}m` };
+}
+
+async function tryAlt(body) {
+  const errors = [];
+  for (const url of ALT_ENDPOINTS) {
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: BROWSER_LIKE_HEADERS,
+        body: JSON.stringify(body),
+        redirect: "manual"          // don’t follow to HTML splash
+      });
+
+      const ct = r.headers.get("content-type") || "";
+      const text = await r.text();
+
+      // If server replied HTML, bubble up for visibility
+      if (!ct.includes("application/json")) {
+        return { ok: false, endpoint: url, status: r.status, html: text };
+      }
+
+      const json = JSON.parse(text);
+      return { ok: r.ok && !json.errors, endpoint: url, status: r.status, json };
+    } catch (e) {
+      errors.push(`${url} → ${e.message}`);
+    }
+  }
+  throw new Error("All Alt endpoints failed: " + errors.join(" | "));
 }
 
 export default async function handler(req, res) {
@@ -63,26 +79,26 @@ export default async function handler(req, res) {
           }
         }`,
       variables: {
-        input: {
-          query: q,
-          status: "ACTIVE",        // live only
-          listingType: "AUCTION",  // auctions only
-          limit,
-          offset
-        }
+        input: { query: q, status: "ACTIVE", listingType: "AUCTION", limit, offset }
       }
     };
 
-    const { response, endpoint } = await postGraphQL(body);
-    const json = await response.json();
+    const result = await tryAlt(body);
 
-    if (!response.ok || json.errors) {
+    // If we got HTML, show it so we can see what Alt is returning (often a 403/edge page)
+    if (!result.ok && result.html) {
       return res
-        .status(response.status || 500)
-        .json({ endpoint, ...json });
+        .status(result.status || 502)
+        .json({ endpoint: result.endpoint, error: "Non-JSON from Alt", preview: result.html.slice(0, 400) });
     }
 
-    const payload = json?.data?.searchCards ?? { total: 0, items: [] };
+    if (!result.ok) {
+      return res
+        .status(result.status || 502)
+        .json({ endpoint: result.endpoint, error: "Alt returned error", details: result.json });
+    }
+
+    const payload = result.json?.data?.searchCards ?? { total: 0, items: [] };
     const items = (payload.items || []).map(it => {
       const tr = isoToHuman(it.endAt);
       return {
@@ -100,7 +116,13 @@ export default async function handler(req, res) {
       };
     });
 
-    res.status(200).json({ endpoint, total: payload.total, limit, offset, items });
+    res.status(200).json({
+      endpoint: result.endpoint,
+      total: payload.total,
+      limit,
+      offset,
+      items
+    });
   } catch (e) {
     res.status(500).json({ error: e.message || "Proxy error" });
   }
