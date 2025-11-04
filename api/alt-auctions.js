@@ -1,6 +1,33 @@
 import fetch from "node-fetch";
 
-// helper to show time remaining
+// Try multiple Alt GraphQL endpoints and use the first that works.
+const ALT_ENDPOINT_CANDIDATES = [
+  "https://api.alt.xyz/graphql",
+  "https://app.alt.xyz/graphql",
+  "https://alt.xyz/graphql"
+];
+
+async function postGraphQL(body) {
+  const errors = [];
+  for (const url of ALT_ENDPOINT_CANDIDATES) {
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      // If DNS resolved and we got a response, return it (even if it's a 4xx/5xx we'll surface below)
+      return { response: r, endpoint: url };
+    } catch (e) {
+      // Keep track of which endpoint failed and why (e.g., ENOTFOUND)
+      errors.push({ url, message: e.message });
+    }
+  }
+  // None resolved — throw a helpful error
+  const detail = errors.map(x => `${x.url} → ${x.message}`).join(" | ");
+  throw new Error(`All Alt endpoints failed DNS/connection: ${detail}`);
+}
+
 function isoToHuman(iso) {
   if (!iso) return { seconds: null, human: null };
   const end = new Date(iso).getTime();
@@ -38,7 +65,7 @@ export default async function handler(req, res) {
       variables: {
         input: {
           query: q,
-          status: "ACTIVE",        // live
+          status: "ACTIVE",        // live only
           listingType: "AUCTION",  // auctions only
           limit,
           offset
@@ -46,18 +73,16 @@ export default async function handler(req, res) {
       }
     };
 
-    const r = await fetch("https://api.alt.xyz/graphql", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
+    const { response, endpoint } = await postGraphQL(body);
+    const json = await response.json();
 
-    const j = await r.json();
-    if (!r.ok || j.errors) {
-      return res.status(r.status || 500).json(j);
+    if (!response.ok || json.errors) {
+      return res
+        .status(response.status || 500)
+        .json({ endpoint, ...json });
     }
 
-    const payload = j?.data?.searchCards ?? { total: 0, items: [] };
+    const payload = json?.data?.searchCards ?? { total: 0, items: [] };
     const items = (payload.items || []).map(it => {
       const tr = isoToHuman(it.endAt);
       return {
@@ -65,8 +90,8 @@ export default async function handler(req, res) {
         title: it.title,
         url: it.url,
         imageUrl: it.imageUrl,
-        status: it.status,          // should be ACTIVE
-        listingType: it.listingType, // should be AUCTION
+        status: it.status,
+        listingType: it.listingType,
         endAt: it.endAt,
         bidCount: it.bidCount ?? null,
         currentPrice: it.price != null ? { value: it.price, currency: "USD" } : null,
@@ -75,7 +100,7 @@ export default async function handler(req, res) {
       };
     });
 
-    res.status(200).json({ total: payload.total, limit, offset, items });
+    res.status(200).json({ endpoint, total: payload.total, limit, offset, items });
   } catch (e) {
     res.status(500).json({ error: e.message || "Proxy error" });
   }
